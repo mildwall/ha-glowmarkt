@@ -584,3 +584,146 @@ async def test_async_import_history_statistics_preserves_cumulative_sum_on_refre
         dt.datetime(2026, 7, 3, 0, 0, tzinfo=dt.timezone.utc).timestamp(),
         dt.datetime(2026, 7, 2, 23, 0, tzinfo=dt.timezone.utc).timestamp(),
     ]
+
+
+def _hour(hour: int) -> dt.datetime:
+    return dt.datetime(2026, 10, 5, hour, 0, tzinfo=dt.timezone.utc)
+
+
+def test_carry_forward_stored_tail_keeps_sum_non_decreasing() -> None:
+    """Issue #4: late data for earlier hours must not leave a negative step."""
+    # The refresh rewrote 16:00 and 17:00 with half-hours Glow delivered late.
+    statistics = [
+        {"start": _hour(16), "sum": 3783.0},
+        {"start": _hour(17), "sum": 3784.138},
+    ]
+    # Rows stored by the earlier refresh still carry the old totals.
+    stored_rows = [
+        (_hour(16), 3780.428),
+        (_hour(17), 3780.428),
+        (_hour(18), 3780.428),
+        (_hour(19), 3780.5),
+    ]
+
+    rows = history._carry_forward_stored_tail(statistics, stored_rows)
+
+    assert [row["start"] for row in rows] == [_hour(16), _hour(17), _hour(18), _hour(19)]
+    assert [row["sum"] for row in rows] == [3783.0, 3784.138, 3784.138, 3784.21]
+
+
+def test_carry_forward_stored_tail_is_noop_without_later_rows() -> None:
+    statistics = [{"start": _hour(16), "sum": 1.0}, {"start": _hour(17), "sum": 2.0}]
+
+    assert history._carry_forward_stored_tail(statistics, []) is statistics
+    assert (
+        history._carry_forward_stored_tail(statistics, [(_hour(16), 0.5), (_hour(17), 1.5)])
+        is statistics
+    )
+    # Later rows already consistent with the refreshed sums: nothing to rewrite.
+    assert (
+        history._carry_forward_stored_tail(
+            statistics, [(_hour(17), 2.0), (_hour(18), 2.5), (_hour(19), 3.0)]
+        )
+        is statistics
+    )
+
+
+def test_carry_forward_stored_tail_never_drops_below_previous_row() -> None:
+    statistics = [{"start": _hour(16), "sum": 10.0}, {"start": _hour(17), "sum": 12.0}]
+    # A stored tail that dipped (e.g. from an earlier partial import).
+    stored_rows = [(_hour(17), 12.0), (_hour(18), 11.0), (_hour(19), 13.0)]
+
+    rows = history._carry_forward_stored_tail(statistics, stored_rows)
+
+    assert [row["sum"] for row in rows] == [10.0, 12.0, 12.0, 13.0]
+
+
+async def test_async_import_history_statistics_has_no_negative_step_after_late_data(
+    async_setup_recorder_instance,
+    hass,
+) -> None:
+    """Issue #4 end to end: a later, shorter refresh must not leave stale lower sums."""
+    timezone = dt.timezone.utc
+    client = FakeGlowClient(
+        [
+            FakeGlowVirtualEntity(
+                "ve-1",
+                "Site 1",
+                resources=[
+                    FakeGlowResource(
+                        "dcc-import",
+                        const.ELEC_CONSUMPTION_CLASSIFIER,
+                        "electricity consumption DCC SM profile reads",
+                    )
+                ],
+            )
+        ]
+    )
+
+    def half_hours(first_hour: int, last_hour: int, value: float):
+        rows = []
+        for hour in range(first_hour, last_hour + 1):
+            for minute in (0, 30):
+                rows.append(
+                    fake_reading(
+                        dt.datetime(2026, 10, 5, hour, minute, tzinfo=timezone), value
+                    )
+                )
+        return rows
+
+    # First refresh: Glow had only the 07:00 hour; later half-hours came back as 0.
+    first_rows = half_hours(7, 7, 0.5) + half_hours(8, 19, 0.0)
+    # Second refresh ends at 18:00 but now has the real usage for 08:00-17:00.
+    second_rows = half_hours(7, 7, 0.5) + half_hours(8, 17, 0.25)
+
+    call_count = 0
+
+    def fake_fetch(resource, start, end, *, chunk_days=10):
+        nonlocal call_count
+        del resource, start, chunk_days
+        call_count += 1
+        if call_count == 1:
+            assert end == dt.datetime(2026, 10, 5, 20, 0, tzinfo=timezone)
+            return first_rows
+        assert end == dt.datetime(2026, 10, 5, 18, 0, tzinfo=timezone)
+        return second_rows
+
+    await async_setup_recorder_instance(hass)
+
+    with (
+        patch.object(history, "_INITIAL_HISTORY_DAYS", 1),
+        patch.object(history, "_RECENT_HISTORY_DAYS", 1),
+        patch.object(history, "_fetch_half_hour_history", side_effect=fake_fetch),
+        patch.object(
+            history,
+            "_history_window_end",
+            side_effect=[
+                dt.datetime(2026, 10, 5, 20, 0, tzinfo=timezone),
+                dt.datetime(2026, 10, 5, 18, 0, tzinfo=timezone),
+            ],
+        ),
+    ):
+        assert await history.async_import_history_statistics(hass, client) is True
+        await async_wait_recording_done(hass)
+        assert await history.async_import_history_statistics(hass, client) is True
+
+    await async_wait_recording_done(hass)
+
+    stats = await hass.async_add_executor_job(
+        partial(
+            get_last_statistics,
+            hass,
+            24,
+            "glowmarkt:site_1_ve_1_electricity_import",
+            True,
+            {"sum"},
+        )
+    )
+    rows = list(reversed(stats["glowmarkt:site_1_ve_1_electricity_import"]))
+    sums = [row["sum"] for row in rows]
+
+    # 07:00 = 1.0, then 10 hours x 0.5 = 6.0 by 17:00; the stale 18:00 and 19:00
+    # rows from the first refresh are carried forward instead of dropping to 1.0.
+    assert len(rows) == 13
+    assert all(later >= earlier for earlier, later in zip(sums, sums[1:]))
+    assert sums[-3:] == [6.0, 6.0, 6.0]

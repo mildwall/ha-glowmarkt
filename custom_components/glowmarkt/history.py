@@ -289,6 +289,84 @@ async def _existing_statistic_sum_before(
     return float(prior_sum)
 
 
+def _row_start_datetime(value) -> datetime:
+    """Return a recorder statistics row start as an aware datetime."""
+    if isinstance(value, datetime):
+        return value if value.tzinfo is not None else value.replace(tzinfo=dt_util.UTC)
+    return datetime.fromtimestamp(float(value), tz=dt_util.UTC)
+
+
+async def _existing_statistic_rows_from(
+    hass: HomeAssistant,
+    statistics_during_period,
+    statistic_id: str,
+    start: datetime,
+) -> list[tuple[datetime, float]]:
+    """Return stored hourly ``(start, sum)`` rows from ``start`` onwards."""
+    rows = await _async_recorder_executor_job(
+        hass,
+        partial(
+            statistics_during_period,
+            hass,
+            start,
+            None,
+            {statistic_id},
+            "hour",
+            None,
+            {"sum"},
+        ),
+    )
+    stored_rows = []
+    for row in rows.get(statistic_id, []):
+        if row.get("sum") is None:
+            continue
+        stored_rows.append((_row_start_datetime(row["start"]), float(row["sum"])))
+    return stored_rows
+
+
+def _carry_forward_stored_tail(
+    statistics: list[dict],
+    stored_rows: list[tuple[datetime, float]],
+) -> list[dict]:
+    """Keep cumulative sums non-decreasing past the end of a refresh.
+
+    A refresh rewrites hourly sums only up to the latest hour Glow has data for.
+    When Glow fills in earlier half-hours late, those hours get higher sums, but
+    rows already stored after the refresh end keep their old, lower sums. Home
+    Assistant then shows a negative usage/cost step that cancels the late data
+    (issue #4). Shift those later rows by the amount the latest overlapping hour
+    moved, and never let a sum fall below the one before it. The rows are
+    rewritten again with real values once Glow's data reaches them.
+    """
+    if not statistics or not stored_rows:
+        return statistics
+
+    new_sums = {row["start"].timestamp(): row["sum"] for row in statistics}
+    stored_sums = {start.timestamp(): value for start, value in stored_rows}
+    overlap = [timestamp for timestamp in new_sums if timestamp in stored_sums]
+    if not overlap:
+        return statistics
+
+    anchor = max(overlap)
+    delta = new_sums[anchor] - stored_sums[anchor]
+    last_start = max(new_sums)
+    previous_sum = new_sums[last_start]
+
+    tail = []
+    changed = False
+    for start, value in sorted(stored_rows, key=lambda item: item[0]):
+        if start.timestamp() <= last_start:
+            continue
+        shifted = round(max(value + delta, previous_sum), 6)
+        changed = changed or shifted != value
+        tail.append({"start": start, "sum": shifted})
+        previous_sum = shifted
+
+    if not changed:
+        return statistics
+    return [*statistics, *tail]
+
+
 def _select_history_targets(
     virtual_entity, resources: list
 ) -> list[HistoryStatisticTarget]:
@@ -578,6 +656,30 @@ async def async_import_history_statistics(
                 history_days,
             )
             continue
+
+        if target.statistic_id in existing_metadata:
+            try:
+                stored_rows = await _existing_statistic_rows_from(
+                    hass,
+                    statistics_during_period,
+                    target.statistic_id,
+                    statistics[0]["start"],
+                )
+            except Exception as ex:  # pylint: disable=broad-except
+                _LOGGER.warning(
+                    "Failed to query stored statistics for %s: %s",
+                    target.statistic_id,
+                    ex,
+                )
+                stored_rows = []
+            imported_rows = len(statistics)
+            statistics = _carry_forward_stored_tail(statistics, stored_rows)
+            if len(statistics) > imported_rows:
+                _LOGGER.debug(
+                    "Carried forward %s stored hourly rows for %s so the cumulative sum never decreases.",
+                    len(statistics) - imported_rows,
+                    target.statistic_id,
+                )
 
         async_add_external_statistics(
             hass,
